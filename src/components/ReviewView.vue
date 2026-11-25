@@ -1,69 +1,91 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import {
-  IconAlertTriangle, IconArrowRight, IconCircleCheck, IconFileText, IconHistory,
-  IconLoader2, IconSparkles,
-} from '@tabler/icons-vue'
-import { currentVersion, dateTime, projectFiles, reviewRule, roles } from '../domain.js'
+import { IconArrowRight, IconArrowUpRight, IconFileText, IconHistory, IconLoader2, IconMessageCircle } from '@tabler/icons-vue'
+import { currentVersion, dateTime, goalFor, money, reviewRule, roles } from '../domain.js'
+import { policySource, reviewFindings, typeFields, typeOf } from '../agentPolicy.js'
+import ReviewAssistant from './ReviewAssistant.vue'
+import ReviewDocumentText from './ReviewDocumentText.vue'
 import Modal from './Modal.vue'
 
-const props = defineProps({ project: Object, role: String, versionHint: Number, api: Object })
+const props = defineProps({ project: Object, role: String, versionHint: Number, api: Object, chats: Map, scenario: String, desk: Boolean })
 const emit = defineEmits(['notify', 'navigate'])
 const latest = computed(() => currentVersion(props.project))
-const versionNumber = ref(latest.value.number)
+const versionNumber = computed(() => props.project.versions.some(item => item.number === props.versionHint) ? props.versionHint : latest.value.number)
 const version = computed(() => props.project.versions.find(item => item.number === versionNumber.value))
-const finding = computed(() => version.value.ai.result)
-const files = computed(() => projectFiles(version.value.form))
-const selectedFile = ref('')
-const readerTab = ref('source')
-const sourceFocus = ref(false)
-const excerpt = ref(null)
-const file = computed(() => files.value.find(item => item.id === selectedFile.value) ?? files.value[0])
+const form = computed(() => version.value.form)
+const goal = computed(() => goalFor(form.value.goalId))
+const type = computed(() => typeOf(form.value))
+const submittedAt = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short', timeZone: 'Asia/Shanghai' })
+const numberLabel = value => value != null && String(value).trim() && Number.isFinite(Number(value)) ? money(Number(value)) : '未填写'
+const specialistFields = computed(() => [
+  ...(type.value === 'product' ? [{ label: '承诺收入', value: numberLabel(form.value.commitment) }] : []),
+  ...(typeFields[type.value] || []).map(field => ({
+    label: field.label.replace('（万元）', ''),
+    value: field.numeric ? numberLabel(form.value.application?.[field.key]) : form.value.application?.[field.key] || '未填写',
+  })),
+])
+const milestones = computed(() => new Map(form.value.milestones.map(item => [item.id, item.name])))
+const selectedRule = ref(null)
+const activeQuote = ref(null)
+const sourceTexts = new Map()
+const attachmentPanels = new Map()
+const analysisOpen = ref(false)
+const findings = computed(() => reviewFindings(version.value.ai.result))
 const record = computed(() => props.project.reviews.find(item => item.number === versionNumber.value))
 const historical = computed(() => versionNumber.value !== latest.value.number)
-const canDecide = computed(() => props.role === 'approver' && props.project.status === 'pending' && !historical.value)
-const reviewLabels = { met: '已满足', insufficient: '证据不足', missing: '缺失' }
+const isApprover = computed(() => props.role === 'approver')
+const canDecide = computed(() => isApprover.value && props.project.status === 'pending' && !historical.value)
+const threadKey = computed(() => JSON.stringify([props.scenario, props.role, props.project.id, versionNumber.value]))
+const messages = computed(() => props.chats.get(threadKey.value) || [])
+const ask = (question, history) => props.api.askReview(props.project.id, versionNumber.value, question, history)
+const overview = computed(() => ({ role: 'assistant', ...ask('评审概览') }))
+const suggestions = computed(() => [
+  '有哪些材料缺口？', '评审依据是什么？',
+  type.value === 'research' ? '如何评估验证方案和复用价值？' : '投资回报怎么看？',
+  '审批前要核实什么？',
+])
 const modal = ref('')
 const reason = ref('')
 const error = ref('')
 
-watch([() => props.versionHint, () => latest.value.number], ([hint, current]) => {
-  versionNumber.value = props.project.versions.some(item => item.number === hint) ? hint : current
-}, { immediate: true })
+watch(versionNumber, () => {
+  activeQuote.value = null
+  analysisOpen.value = false
+  modal.value = ''
+})
+
+function askAssistant(question) {
+  if (!isApprover.value) return
+  const answer = ask(question, messages.value)
+  if (!props.chats.has(threadKey.value)) props.chats.set(threadKey.value, [])
+  props.chats.get(threadKey.value).push({ role: 'user', text: question }, { role: 'assistant', ...answer })
+}
 
 function versionPath(number) {
-  return '/project/' + props.project.id + '/review' + (number === latest.value.number ? '' : '?v=' + number)
+  const base = props.desk ? '/workspace/' + props.project.id : '/project/' + props.project.id + '/review'
+  return base + (number === latest.value.number ? '' : '?v=' + number)
 }
 
-function switchVersion(event) {
-  emit('navigate', versionPath(Number(event.target.value)))
+function openRule(rule) {
+  selectedRule.value = rule === reviewRule.id && !version.value.form.application ? reviewRule : policySource(rule)
+  if (selectedRule.value) modal.value = 'rule'
 }
-
-const blocks = computed(() => file.value.body.split('\n').map((line, index) => {
-  const evidence = finding.value?.evidence
-  const quote = evidence?.id === file.value.id ? evidence.text : ''
-  const start = quote ? line.indexOf(quote) : -1
-  return {
-    key: index, line, heading: /^[一二三四五六七八九十]+、/u.test(line),
-    highlight: start >= 0 ? [line.slice(0, start), quote, line.slice(start + quote.length)] : null,
-  }
-}).filter(item => item.line.trim()))
-
-async function openReader(tab, id, focusEvidence = false) {
-  selectedFile.value = id || finding.value?.evidence?.id || files.value[0].id
-  readerTab.value = tab
-  sourceFocus.value = focusEvidence
-  modal.value = 'reader'
-  if (focusEvidence) await focusQuote()
+function openChatSource(item) {
+  if (item.file) focusQuote(item.file, item.quote)
+  else openRule(item.rule)
 }
-async function focusQuote() {
+function registerSource(collection, id, element) {
+  if (element) collection.set(id, element)
+  else collection.delete(id)
+}
+async function focusQuote(id, text) {
+  const source = sourceTexts.get(id)
+  if (!source) return
+  activeQuote.value = text ? { id, text } : null
+  const attachment = attachmentPanels.get(id)
+  if (attachment) attachment.open = true
   await nextTick()
-  excerpt.value?.scrollIntoView({ block: 'nearest', behavior: 'instant' })
-  excerpt.value?.focus({ preventScroll: true })
-}
-function openSourceTab() {
-  readerTab.value = 'source'
-  if (sourceFocus.value) focusQuote()
+  source.focus()
 }
 function openDecision(type) {
   modal.value = type
@@ -92,125 +114,131 @@ function retry() {
 
 <template>
   <section class="review-view" aria-label="立项评审">
-    <div v-if="historical" class="history-banner">
-      <IconHistory :size="19" aria-hidden="true" />
-      <span>正在查看历史提交 v{{ versionNumber }}</span>
-      <a :href="'#' + versionPath(latest.number)" class="text-button">回到最新版本<IconArrowRight :size="16" aria-hidden="true" /></a>
-    </div>
-
-    <div class="review-grid">
-      <div class="review-main stack">
-        <section class="surface work-panel">
-          <header class="work-panel-head">
-            <div class="heading-with-icon"><IconSparkles :size="20" aria-hidden="true" /><h2>AI 核查</h2></div>
-            <label class="version-select">
-              <span>提交版本</span>
-              <select :value="versionNumber" @change="switchVersion">
-                <option v-for="item in [...project.versions].reverse()" :key="item.number" :value="item.number">
-                  v{{ item.number }}{{ item.number === latest.number ? ' · 最新' : '' }}
-                </option>
-              </select>
-            </label>
-          </header>
-
-          <div class="review-section-body">
-            <div v-if="version.ai.status === 'processing'" class="inline-alert neutral-state" role="status">
-              <div class="inline-state"><IconLoader2 class="spin" :size="18" aria-hidden="true" /><strong>核查处理中</strong></div>
-              <p>可以先查看申请材料。</p>
-            </div>
-            <div v-if="version.ai.status === 'failed'" class="inline-alert" role="status">
-              <strong>核查未完成</strong><p>{{ version.ai.error }}</p>
-              <button v-if="canDecide" type="button" class="text-button" @click="retry">重试核查</button>
-            </div>
-            <div v-if="finding" class="finding-card">
-              <div class="finding-main">
-                <div class="finding-title"><h3>客户试用说明</h3><span class="result-label" :data-result="finding.status">
-                  <IconCircleCheck v-if="finding.status === 'met'" :size="16" aria-hidden="true" />
-                  <IconAlertTriangle v-else :size="16" aria-hidden="true" />{{ reviewLabels[finding.status] }}
-                </span></div>
-                <p class="muted">{{ finding.suggestion }}</p>
-              </div>
-              <button class="button secondary small" type="button" @click="openReader(finding.evidence ? 'source' : 'rule', finding.evidence?.id, !!finding.evidence)">
-                查看依据<IconArrowRight :size="16" aria-hidden="true" />
-              </button>
-              <blockquote v-if="finding.evidence">{{ finding.evidence.text }}<cite>{{ finding.evidence.title }} · v{{ version.number }}</cite></blockquote>
-            </div>
-          </div>
-        </section>
-
-        <section class="surface work-panel">
-          <header class="work-panel-head"><div class="heading-with-icon"><IconFileText :size="20" aria-hidden="true" /><h2>申请材料</h2></div><span class="muted">v{{ versionNumber }} · {{ files.length }} 份</span></header>
-          <ul class="task-list">
-            <li v-for="item in files" :key="item.id" class="file-row">
-              <IconFileText :size="20" aria-hidden="true" /><button type="button" class="file-link" @click="openReader('source', item.id)">{{ item.title }}</button>
-              <IconArrowRight :size="16" aria-hidden="true" />
-            </li>
-          </ul>
-        </section>
-      </div>
-
-      <aside class="review-side stack" aria-label="审批操作和流转记录">
-        <section class="surface work-panel">
-          <header class="work-panel-head"><h2>{{ canDecide ? '审批决定' : '版本状态' }}</h2></header>
-          <div class="review-section-body decision-body">
-            <dl class="description-list">
-              <dt>提交版本</dt><dd>v{{ versionNumber }}</dd>
-              <dt>项目负责人</dt><dd>{{ roles.owner.name }}</dd>
-              <dt>提交时间</dt><dd>{{ dateTime(version.submittedAt) }}</dd>
-            </dl>
-            <template v-if="canDecide">
-              <div class="decision-actions">
-                <button class="button primary" type="button" @click="openDecision('approve')">批准立项</button>
-                <button class="button secondary" type="button" @click="openDecision('return')">退回补件</button>
-              </div>
-              <p class="muted decision-note">审批提交后将返回待审批队列。</p>
-            </template>
-            <div v-else-if="record" class="decision-outcome">
-              <strong>{{ record.action === 'return' ? '已退回补件' : '已批准立项' }}</strong>
-              <p v-if="record.reason">{{ record.reason }}</p><p class="muted">{{ record.by }} · {{ dateTime(record.at) }}</p>
-            </div>
-            <p v-else class="muted decision-note">等待产品线审批人处理。</p>
-          </div>
-        </section>
-
-        <section class="surface work-panel">
-          <header class="work-panel-head"><div class="heading-with-icon"><IconHistory :size="19" aria-hidden="true" /><h2>提交流转</h2></div></header>
-          <ul class="task-list">
-            <li v-for="item in [...project.versions].reverse()" :key="item.number">
-              <a class="version-row" :href="'#' + versionPath(item.number)" :aria-current="item.number === versionNumber ? 'true' : undefined">
-                <span class="number">v{{ item.number }}</span>
-                <span>{{ project.reviews.find(review => review.number === item.number)?.action === 'return' ? '已退回' : item.number === project.approvedVersion ? '已批准' : '已提交' }}</span>
-                <time :datetime="item.submittedAt" class="muted">{{ dateTime(item.submittedAt) }}</time>
-              </a>
-            </li>
-          </ul>
-        </section>
-      </aside>
-    </div>
-
-    <Modal v-if="modal === 'reader'" title="核查依据与材料" side @close="modal = ''">
-      <div class="reader-body">
-        <div class="tabs" aria-label="查看依据">
-          <button type="button" :aria-pressed="readerTab === 'source'" @click="openSourceTab">材料原文</button>
-          <button type="button" :aria-pressed="readerTab === 'rule'" @click="readerTab = 'rule'">准入条款</button>
+    <div class="desk-folio">
+      <div class="review-dossier-head">
+        <div><p>立项申报单</p><h2>{{ form.name }}</h2></div>
+        <div class="review-dossier-tools">
+          <label class="version-select"><span>提交版本</span><select :value="versionNumber" @change="emit('navigate', versionPath(Number($event.target.value)))">
+            <option v-for="item in [...project.versions].reverse()" :key="item.number" :value="item.number">v{{ item.number }}{{ item.number === latest.number ? ' · 最新' : '' }}</option>
+          </select></label>
+          <a v-if="desk" href="#/approvals/history" class="button secondary">查看评审记录<IconArrowUpRight :size="16" aria-hidden="true" /></a>
         </div>
-        <template v-if="readerTab === 'source'">
-          <label>申请材料<select v-model="selectedFile"><option v-for="item in files" :key="item.id" :value="item.id">{{ item.title }}</option></select></label>
-          <article class="doc-prose">
-            <h3>{{ file.title }}</h3>
-            <template v-for="block in blocks" :key="block.key">
-              <p v-if="block.highlight" :ref="el => { if (el) excerpt = el }" class="evidence-line" tabindex="-1">
-                {{ block.highlight[0] }}<mark>{{ block.highlight[1] }}</mark>{{ block.highlight[2] }}
-              </p>
-              <h4 v-else-if="block.heading">{{ block.line }}</h4>
-              <p v-else>{{ block.line }}</p>
-            </template>
-          </article>
-        </template>
-        <section v-else class="rule-document">
-          <h3>{{ reviewRule.title }}</h3><p class="muted">{{ reviewRule.id }} · 版本 {{ reviewRule.version }}</p><p>{{ reviewRule.text }}</p>
+      </div>
+      <div v-if="historical" class="review-historical">
+        <IconHistory :size="18" aria-hidden="true" />
+        <span>历史提交 v{{ versionNumber }}</span>
+        <a :href="'#' + versionPath(latest.number)" class="text-button">回到最新版本<IconArrowRight :size="16" aria-hidden="true" /></a>
+      </div>
+      <div :key="versionNumber" class="review-submission">
+        <section class="review-submission-section">
+          <h3>基本信息</h3>
+          <dl class="review-field-grid">
+            <div><dt>项目类型</dt><dd>{{ form.category || '未填写' }}</dd></div>
+            <div><dt>关联年度目标</dt><dd>{{ goal ? goal.year + ' 年度 · ' + goal.name : '未关联' }}</dd></div>
+            <div><dt>项目起始日期</dt><dd>{{ form.startDate || '未填写' }}</dd></div>
+            <div><dt>申请人</dt><dd>{{ roles[project.ownerId]?.name || '未记录' }}</dd></div>
+            <div><dt>提交时间</dt><dd><time v-if="version.submittedAt" :datetime="version.submittedAt">{{ submittedAt.format(new Date(version.submittedAt)) }}</time><span v-else>未记录</span></dd></div>
+            <div v-if="version.approval"><dt>提交至</dt><dd>{{ version.approval.label }} {{ version.approval.name }}</dd></div>
+          </dl>
+        </section>
+        <section class="review-submission-section">
+          <h3>{{ type === 'research' ? '技术问题' : '客户需求' }}</h3>
+          <ReviewDocumentText :ref="el => registerSource(sourceTexts, 'brief', el)" :body="form.description"
+            :quote="activeQuote?.id === 'brief' ? activeQuote.text : undefined" />
+        </section>
+        <section v-if="specialistFields.length" class="review-submission-section">
+          <h3>{{ type === 'research' ? '技术方案' : '投资与收入' }}</h3>
+          <dl class="review-field-grid" :class="{ 'review-field-grid-long': type === 'research' }">
+            <div v-for="field in specialistFields" :key="field.label"><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>
+          </dl>
+        </section>
+        <section class="review-submission-section">
+          <h3>里程碑计划</h3>
+          <table v-if="form.milestones.length" class="review-milestones" aria-label="提交的里程碑计划">
+            <thead><tr><th scope="col">里程碑</th><th scope="col">计划日期</th><th scope="col">前置里程碑</th></tr></thead>
+            <tbody>
+              <tr v-for="item in form.milestones" :key="item.id">
+                <th scope="row">{{ item.name || '未命名' }}</th><td>{{ item.planned || '未填写' }}</td>
+                <td>{{ item.dependsOn ? milestones.get(item.dependsOn) || '未找到对应里程碑' : '无' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-else class="muted">本版未提交里程碑。</p>
+        </section>
+        <section class="review-submission-section">
+          <h3>申报附件<span class="review-section-count">{{ form.materials.length }} 份</span></h3>
+          <div v-if="form.materials.length" class="review-attachments">
+            <details v-for="attachment in form.materials" :key="attachment.id" :ref="el => registerSource(attachmentPanels, attachment.id, el)">
+              <summary><IconFileText :size="17" aria-hidden="true" />{{ attachment.title || '未命名附件' }}</summary>
+              <ReviewDocumentText :ref="el => registerSource(sourceTexts, attachment.id, el)" :body="attachment.body"
+                :quote="activeQuote?.id === attachment.id ? activeQuote.text : undefined" />
+            </details>
+          </div>
+          <p v-else class="muted">本版未提交附件。</p>
         </section>
       </div>
+    </div>
+
+    <section class="desk-folio review-analysis" aria-label="评审辅助">
+      <header v-if="isApprover" class="review-analysis-head">
+        <h3>评审辅助</h3>
+        <button type="button" class="button secondary" :aria-expanded="analysisOpen" aria-controls="review-assistant-panel" @click="analysisOpen = !analysisOpen">
+          <IconMessageCircle :size="18" aria-hidden="true" />{{ analysisOpen ? '收起 AI 分析' : messages.length ? '继续 AI 分析' : '发起 AI 分析' }}
+        </button>
+      </header>
+      <div v-if="isApprover" id="review-assistant-panel" :hidden="!analysisOpen">
+        <ReviewAssistant v-if="analysisOpen" :key="threadKey" :version="versionNumber" :overview="overview"
+          :messages="messages" :suggestions="suggestions" @question="askAssistant" @source="openChatSource" />
+      </div>
+      <component :is="isApprover ? 'details' : 'section'" class="review-verification">
+        <summary v-if="isApprover">材料核查</summary>
+        <h3 v-else>材料核查</h3>
+        <div class="review-verification-body">
+          <p v-if="version.ai.status === 'processing'" class="inline-state muted" role="status"><IconLoader2 class="spin" :size="18" aria-hidden="true" />正在核查材料</p>
+          <div v-if="version.ai.status === 'failed'" class="inline-alert" role="status"><strong>核查未完成</strong><p>{{ version.ai.error }}</p><button v-if="canDecide" type="button" class="text-button" @click="retry">重试核查</button></div>
+          <article v-for="(issue, index) in findings" :key="index" class="review-finding">
+            <header><h4>{{ issue.title || policySource(issue.source)?.title }}</h4><span class="agent-level" :data-level="issue.level">{{ issue.level }}</span></header>
+            <p>{{ issue.message }}</p>
+            <div class="desk-inline-actions">
+              <button v-if="issue.evidence" type="button" class="text-button" @click="focusQuote(issue.evidence.id, issue.evidence.text)">定位原文</button>
+              <button type="button" class="text-button" @click="openRule(issue.source)">查看条款</button>
+            </div>
+          </article>
+        </div>
+      </component>
+    </section>
+
+    <section class="desk-folio" aria-labelledby="review-decision-heading">
+      <div class="review-decision">
+        <h3 id="review-decision-heading">{{ canDecide ? '审批决定' : '版本状态' }}</h3>
+        <div v-if="canDecide" class="decision-actions">
+          <button class="button secondary" type="button" @click="openDecision('return')">退回补件</button>
+          <button class="button primary" type="button" @click="openDecision('approve')">批准立项</button>
+        </div>
+        <div v-else class="decision-body">
+          <div v-if="record" class="decision-outcome">
+            <strong>{{ record.action === 'return' ? '已退回补件' : '已批准立项' }}</strong>
+            <p v-if="record.reason">{{ record.reason }}</p><p class="muted">{{ record.by }} · {{ dateTime(record.at) }}</p>
+          </div>
+          <p v-else class="muted">等待产品线审批人处理。</p>
+        </div>
+      </div>
+      <details v-if="project.versions.length > 1" class="review-history">
+        <summary>提交记录</summary>
+        <ul class="task-list">
+          <li v-for="item in [...project.versions].reverse()" :key="item.number">
+            <a class="version-row" :href="'#' + versionPath(item.number)" :aria-current="item.number === versionNumber ? 'true' : undefined">
+              <span class="number">v{{ item.number }}</span>
+              <span>{{ project.reviews.find(review => review.number === item.number)?.action === 'return' ? '已退回' : item.number === project.approvedVersion ? '已批准' : '已提交' }}</span>
+              <time :datetime="item.submittedAt" class="muted">{{ dateTime(item.submittedAt) }}</time>
+            </a>
+          </li>
+        </ul>
+      </details>
+    </section>
+
+    <Modal v-if="modal === 'rule'" title="准入条款" side @close="modal = ''">
+      <div class="agent-reader"><article><span class="agent-meta">{{ selectedRule?.id }} · {{ selectedRule?.version || version.policyVersion }}</span><h3>{{ selectedRule?.title }}</h3><p>{{ selectedRule?.text }}</p></article></div>
     </Modal>
     <Modal v-else-if="modal" :side="modal === 'return'" :title="modal === 'return' ? '退回补件' : '批准立项'" @close="modal = ''">
       <form class="dialog-form" @submit.prevent="decide">

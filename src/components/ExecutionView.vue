@@ -1,6 +1,6 @@
 <script setup>
 import { computed, reactive, ref } from 'vue'
-import { IconAlertTriangle, IconChevronRight, IconLoader2 } from '@tabler/icons-vue'
+import { IconAlertTriangle, IconChevronRight } from '@tabler/icons-vue'
 import {
   aiStates, alertStates, dateTime, dayLabel, delayDays, delayThreshold, goalFor, localToday, money, percentage,
 } from '../domain.js'
@@ -110,11 +110,9 @@ const title = computed(() => ({
           <strong class="warning-text">延期 {{ alert.delay }} 天</strong>
         </div>
         <p class="muted">原计划 {{ dayLabel(alert.planned, project.startDate) }} · 预计 {{ dayLabel(alert.forecast, project.startDate) }}</p>
-        <div class="analysis-block">
-          <div class="section-head">
-            <h4>AI 延期分析</h4>
-            <span v-if="latest(alert)" class="muted inline-state"><IconLoader2 v-if="latest(alert).status === 'processing'" class="spin" :size="17" />{{ aiStates[latest(alert).status] }}</span>
-          </div>
+        <a class="text-button" :href="'#/risks/' + project.id + '?alert=' + encodeURIComponent(alert.id)">查看与分析预警<IconChevronRight :size="16" aria-hidden="true" /></a>
+        <details class="analysis-block">
+          <summary>分析记录<span v-if="latest(alert)" class="muted"> · {{ aiStates[latest(alert).status] }}</span></summary>
           <p v-if="latest(alert)?.error" class="field-error">{{ latest(alert).error }}</p>
           <template v-if="recentResult(alert)">
             <p v-if="recentResult(alert).input.forecast !== alert.forecast" class="warning-text">下方分析基于历史预计日期。</p>
@@ -128,7 +126,7 @@ const title = computed(() => ({
           <button v-if="owner && alert.state !== 'closed' && latest(alert)?.status !== 'processing'" type="button" class="text-button" @click="analyze(alert)">
             {{ latest(alert)?.status === 'failed' ? '重试分析' : '重新分析' }}
           </button>
-        </div>
+        </details>
         <dl v-if="alert.treatment || alert.state === 'closed'" class="description-list treatment-list">
           <template v-if="alert.treatment">
             <dt>处理措施</dt><dd>{{ alert.treatment.measure }}</dd>

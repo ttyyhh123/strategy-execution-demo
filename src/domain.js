@@ -27,6 +27,12 @@ export const goals = [{
   year: 2026,
   amount: 1000,
   guidance: '优先支持可验证客户需求并具备试用计划的工业设备产品项目。',
+}, {
+  id: 'technical-capability-2026',
+  name: '技术能力建设目标（演示）',
+  year: 2026,
+  amount: 0,
+  guidance: '关注技术方案验证与跨项目复用。',
 }]
 
 const DAY = 86400000
@@ -147,7 +153,8 @@ export function cleanForm(input, submitting) {
   const form = clone(input)
   form.name = form.name.trim()
   form.description = form.description.trim()
-  form.commitment = form.commitment === '' ? '' : Number(form.commitment)
+  const research = form.application?.type === 'research'
+  form.commitment = research ? 0 : form.commitment === '' ? '' : Number(form.commitment)
   const goal = goalFor(form.goalId)
   if (!form.name) throw new Error('请输入项目名称。')
   if (!goal) throw new Error('请选择年度目标。')
@@ -155,11 +162,11 @@ export function cleanForm(input, submitting) {
     .filter(material => material.title || material.body)
   form.milestones = form.milestones.map(milestone => ({ ...milestone, name: milestone.name.trim() }))
   if (!submitting) return form
-  if (!form.category || !form.description.trim()) throw new Error('请填写项目类别和客户需求。')
-  if (!Number.isFinite(form.commitment) || form.commitment <= 0) throw new Error('承诺收入须大于 0 万元。')
-  if (!form.startDate || Number(form.startDate.slice(0, 4)) !== goal.year) throw new Error('项目起始日期须与目标年度一致。')
+  if (!form.category || !form.description.trim()) throw new Error(research ? '请填写项目类别和技术问题。' : '请填写项目类别和客户需求。')
+  if (!research && (!Number.isFinite(form.commitment) || form.commitment <= 0)) throw new Error('承诺收入须大于 0 万元。')
+  if (!validCalendarDate(form.startDate) || Number(form.startDate.slice(0, 4)) !== goal.year) throw new Error('请填写有效的项目起始日期，年份须与目标年度一致。')
   if (form.materials.some(material => !material.title || !material.body)) throw new Error('每份材料需填写名称与正文。')
-  if (!form.milestones.length || form.milestones.some(milestone => !milestone.name || !milestone.planned)) {
+  if (!form.milestones.length || form.milestones.some(milestone => !milestone.name || !validCalendarDate(milestone.planned))) {
     throw new Error('至少填写一个里程碑，补齐各里程碑的名称和计划日期。')
   }
   const positions = new Map(form.milestones.map((milestone, index) => [milestone.id, index]))
@@ -168,6 +175,24 @@ export function cleanForm(input, submitting) {
     throw new Error('里程碑计划须在项目起始日或之后，前置节点须选上一行或更早的里程碑。')
   }
   return form
+}
+
+export function validCalendarDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/u.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value
+}
+
+export function seedOperations(closed = false) {
+  const scenario = seedScenario('review')
+  const project = scenario.projects[0]
+  project.status = closed ? 'closed' : 'active'
+  project.approvedVersion = 2
+  project.reviews.push({ number: 2, action: 'approve', reason: '', by: roles.approver.name, at: '2026-11-22T02:00:00Z' })
+  const milestone = project.milestones[0]
+  Object.assign(milestone, { forecast: '2026-11-27', actual: closed ? '2026-11-27' : '', note: '客户现场设备接入准备推迟，试用窗口有待重新确认。' })
+  project.alerts.push({ id: 'alert-sample-trial', milestoneId: milestone.id, planned: milestone.planned,
+    forecast: milestone.forecast, delay: 7, state: closed ? 'closed' : 'open', createdAt: '2026-11-23T02:00:00Z', analyses: [], treatment: null })
+  if (closed) project.closing = { year: 2026, date: '2026-12-24', amount: 210, source: '演示财务确认单 FIN-2026-01', note: '', by: roles.owner.name, at: '2026-12-24T02:00:00Z' }
+  return scenario
 }
 
 export function goalTotals(projects, goal) {

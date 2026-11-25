@@ -1,10 +1,12 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import {
   canEdit, canRead, cleanForm, clone, currentVersion, delayDays, delayThreshold, goalFor,
-  inspectDelay, inspectSubmission, makeId, now, roles, seedScenario,
+  inspectDelay, makeId, now, roles, seedScenario, seedOperations,
 } from './domain.js'
+import { analyzeRisk, approvalRoute, askReview, blockingIssues, checkApplication, policyVersion, queryMetrics, reviewSubmission } from './agentPolicy.js'
 
-const storageKey = 'strategy-execution-demo-v1'
+const storageKey = 'strategy-execution-demo-assistants-v2'
+const previousStorageKey = 'strategy-execution-demo-v1'
 
 export function seedState() {
   return { flow: seedScenario('flow'), review: seedScenario('review'), role: 'approver', scenario: 'review' }
@@ -17,17 +19,19 @@ export function normalizeState(input) {
   return {
     flow: clone(source.flow),
     review: clone(source.review),
+    execution: clone(source.execution || seedOperations()),
+    results: clone(source.results || seedOperations(true)),
     role: roles[source.role] ? source.role : 'approver',
-    scenario: source.scenario === 'flow' ? 'flow' : 'review',
+    scenario: ['flow', 'review', 'execution', 'results'].includes(source.scenario) ? source.scenario : 'review',
   }
 }
 
 function loadLocalState() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKey))
+    const saved = JSON.parse(localStorage.getItem(storageKey) || localStorage.getItem(previousStorageKey))
     if (saved?.flow?.projects && saved?.review?.projects) return saved
   } catch { /* A fresh demo remains usable when browser storage is unavailable. */ }
-  return seedState()
+  return { ...seedState(), role: 'owner', scenario: 'flow' }
 }
 
 const projectHref = (id, tab, version) => '#/project/' + id + '/' + tab + (version ? '?v=' + version : '')
@@ -61,6 +65,8 @@ export function createDemoStore(initialState, options = {}) {
     suspend += 1
     data.flow = normalized.flow
     data.review = normalized.review
+    data.execution = normalized.execution
+    data.results = normalized.results
     data.role = normalized.role
     data.scenario = normalized.scenario
     nextTick(() => { suspend -= 1 })
@@ -94,10 +100,10 @@ export function createDemoStore(initialState, options = {}) {
     finishTask(task, produce)
   }
 
-  for (const scenarioState of [data.flow, data.review]) {
+  for (const scenarioState of [data.flow, data.review, data.execution, data.results]) {
     for (const project of scenarioState.projects) {
       for (const version of project.versions) {
-        if (version.ai.status === 'processing') finishTask(version.ai, () => inspectSubmission(version.form))
+        if (version.ai.status === 'processing') finishTask(version.ai, () => reviewSubmission(version.form))
       }
       for (const alert of project.alerts) {
         for (const task of alert.analyses) {
@@ -119,6 +125,10 @@ export function createDemoStore(initialState, options = {}) {
   function saveForm(input, id, submitting) {
     let project = active.value.projects.find(item => item.id === id)
     if ((id && !project) || !canEdit(project, data.role)) throw new Error('当前项目无法编辑。')
+    if (submitting) {
+      const blocking = blockingIssues(checkApplication(input))
+      if (blocking.length) throw new Error('提交已拦截。' + blocking[0].message)
+    }
     const form = cleanForm(input, submitting)
     if (!project) {
       const newId = makeId('project')
@@ -131,9 +141,9 @@ export function createDemoStore(initialState, options = {}) {
     Object.assign(project, form)
     if (submitting) {
       project.status = 'pending'
-      project.versions.push({ number: project.versions.length + 1, submittedAt: now(), form: clone(form), ai: {} })
+      project.versions.push({ number: project.versions.length + 1, submittedAt: now(), form: clone(form), ai: {}, approval: approvalRoute(), policyVersion })
       const version = currentVersion(project)
-      queue(version.ai, () => inspectSubmission(version.form))
+      queue(version.ai, () => reviewSubmission(version.form))
       record(version.number > 1 ? '提交补件' : '提交申请', {
         projectId: project.id, projectName: project.name, version: version.number,
         href: projectHref(project.id, 'review', version.number),
@@ -170,7 +180,7 @@ export function createDemoStore(initialState, options = {}) {
     if (version.number !== currentVersion(project).number || version.ai.status !== 'failed') {
       throw new Error('请在当前待审批版本中重试。')
     }
-    queue(version.ai, () => inspectSubmission(version.form))
+    queue(version.ai, () => reviewSubmission(version.form))
   }
 
   function analyze(project, alert) {
@@ -295,6 +305,9 @@ export function createDemoStore(initialState, options = {}) {
     data, active, readable, saveForm, decide, retryReview,
     updateSchedule, analyze, handleAlert, closeAlert, closeProject,
     snapshot, applyRemote,
+    askRisk: (projectId, alertId, question, history) => analyzeRisk(active.value.projects, data.role, projectId, alertId, question, history),
+    askMetrics: (question, history) => queryMetrics(active.value.projects, data.role, question, history),
+    askReview: (id, number, question, history) => askReview(active.value.projects, data.role, id, number, question, history),
   }
 }
 
